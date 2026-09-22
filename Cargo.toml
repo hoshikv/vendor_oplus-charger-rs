@@ -1,0 +1,23 @@
+[package]
+name = "vendor-oplus-charger-hal"
+version = "10.0.0"
+edition = "2021"
+description = "Custom OPlus charger AIDL HAL for Xiaomi (Rust port, rsbinder)"
+
+[[bin]]
+name = "charger-hal-service"
+path = "src/main.rs"
+
+[dependencies]
+rsbinder = { version = "0.10", default-features = false }
+libc = "0.2"
+
+[build-dependencies]
+rsbinder-aidl = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
