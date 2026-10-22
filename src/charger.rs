@@ -1,26 +1,16 @@
 
 
+
+
+
+
 #![allow(non_snake_case)]
 
 use std::fs;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn hook_log(msg: &str) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() % 100_000)
-        .unwrap_or(0);
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .write(true)
-        .open("/data/local/tmp/chg_hook.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "[{}] {}", now, msg)
-        });
-}
+fn hook_log(_msg: &str) {}
 
 use rsbinder::{BinderResult, Interface};
 
@@ -28,15 +18,17 @@ use crate::aidl_bindings::vendor::oplus::hardware::charger::ChgFuncFlag::ChgFunc
 use crate::aidl_bindings::vendor::oplus::hardware::charger::ICharger::ICharger;
 use crate::aidl_bindings::vendor::oplus::hardware::charger::testKitFeatureTestResult::testKitFeatureTestResult;
 
+
 const DECIMAL_FAST_WINDOW: f64 = 60.0;
 const DECIMAL_FAST_INTERVAL: f64 = 0.20;
 const DECIMAL_SLOW_INTERVAL: f64 = 1.0;
 const SPAN_HISTORY_SIZE: usize = 5;
 
-const CHARGE_CONTROL_EN_PATHS: &[&str] = &[
-    "/sys/class/qcom-battery/charge_control_en",
-    "/sys/class/power_supply/battery/charge_control_en",
-];
+
+
+
+
+
 const CHARGE_END_THRESHOLD_PATHS: &[&str] = &[
     "/sys/class/power_supply/battery/charge_control_end_threshold",
     "/sys/class/qcom-battery/charge_control_end_threshold",
@@ -47,16 +39,17 @@ const CHARGE_START_THRESHOLD_PATHS: &[&str] = &[
 ];
 const CHARGE_INPUT_SUSPEND_PATHS: &[&str] = &[
     "/sys/class/qcom-battery/input_suspend",
-    "/sys/class/power_supply/usb/input_suspend",
-    "/sys/class/power_supply/main/input_suspend",
 ];
 const CHARGE_LIMIT_RESUME_DELTA: i32 = 5;
 
 const RESUME_COOLDOWN_SECS: u64 = 60;
 
+
 fn read_raw(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
+
+
 
 fn read_long(path: &str) -> Option<i64> {
     let s = read_raw(path)?;
@@ -76,17 +69,21 @@ fn read_long(path: &str) -> Option<i64> {
     t[..i].parse::<i64>().ok()
 }
 
+
 fn read_int_node(path: &str) -> i32 {
     read_long(path).map(|v| v as i32).unwrap_or(-1)
 }
+
 
 fn read_milli_node(path: &str, fallback: i32) -> i32 {
     read_long(path).map(|v| (v / 1000) as i32).unwrap_or(fallback)
 }
 
+
 fn read_int_or(path: &str, fallback: i32) -> i32 {
     read_long(path).map(|v| v as i32).unwrap_or(fallback)
 }
+
 
 fn read_str_node(path: &str) -> String {
     match read_raw(path) {
@@ -96,6 +93,8 @@ fn read_str_node(path: &str) -> String {
         None => String::new(),
     }
 }
+
+
 
 fn read_string_any(paths: &[&str]) -> String {
     for p in paths {
@@ -129,19 +128,28 @@ fn write_string_any(paths: &[&str], value: &str) {
     }
 }
 
+
+
+
 fn parse_charge_limit_state_payload(value: &str) -> (i32, Option<i32>) {
     let ints: Vec<i32> = value
         .split('+')
         .filter_map(|p| p.trim().parse::<i32>().ok())
         .collect();
     if ints.len() >= 3 && ints[0] == 2 {
+
         (ints[1], Some(ints[2]))
+    } else if ints.len() >= 2 && ints[0] == 2 {
+
+        (ints[1], None)
     } else if ints.len() >= 2 {
         (ints[0], Some(ints[1]))
     } else {
         (parse_first_int(value).unwrap_or(0), None)
     }
 }
+
+
 
 fn parse_charge_limit_control_payload(value: &str) -> (i32, Option<i32>, i32, Option<i32>) {
     let ints: Vec<i32> = value
@@ -163,6 +171,7 @@ fn parse_first_int(value: &str) -> Option<i32> {
         .find(|part| !part.is_empty() && *part != "-")
         .and_then(|part| part.parse::<i32>().ok())
 }
+
 
 use std::sync::Arc;
 struct DecimalState {
@@ -213,6 +222,7 @@ impl Charger {
 
     fn get_adapter_power_w(&self) -> i32 {
 
+
         read_int_any(&[
             "/sys/class/qcom-battery/apdo_max",
             "/sys/class/qcom-battery/power_max",
@@ -258,6 +268,8 @@ impl Charger {
             "USB" | "SDP" | "USB_SDP" | "CDP" | "USB_CDP" | "PC" | "PC_PORT"
         )
     }
+
+
 
     fn classify_fast_charge(&self) -> i32 {
         let online = self.get_usb_online() != 0;
@@ -386,6 +398,7 @@ impl Charger {
             && self.get_adapter_power_w() > 0
     }
 
+
     pub fn is_charge_limit_active(&self) -> bool {
         self.charge_limit_switch_enabled()
             && *self.charge_limit_active.lock().unwrap()
@@ -401,6 +414,8 @@ impl Charger {
 
     fn set_charge_limit_value(&self, value: &str) {
         hook_log(&format!("set_value payload={}", value));
+
+
 
         let (_, limit, _force, _recharge) = parse_charge_limit_control_payload(value);
         let parsed = limit.or_else(|| parse_first_int(value));
@@ -418,6 +433,7 @@ impl Charger {
         self.apply_charge_control_limit(suspend);
         if !suspend && was_active {
 
+
             *self.last_resume.lock().unwrap() = Instant::now();
         }
     }
@@ -432,6 +448,7 @@ impl Charger {
         if enabled == 0 {
             hook_log(&format!("set_state enabled=0 -> DISABLE"));
             *self.charge_limit_active.lock().unwrap() = false;
+            *self.chg_up_limit_value.lock().unwrap() = String::new();
             self.apply_charge_control_limit(false);
         } else {
 
@@ -447,6 +464,10 @@ impl Charger {
             }
         }
     }
+
+
+
+
 
     fn should_suspend(&self, capacity: i32) -> bool {
         let Some(limit) = self.charge_limit_target() else {
@@ -468,42 +489,40 @@ impl Charger {
 
     fn apply_charge_control_limit(&self, restrict: bool) {
         let val = if restrict { "1" } else { "0" };
-
-        for p in CHARGE_INPUT_SUSPEND_PATHS {
-            let cur = read_str_node(p);
-            if cur == val {
-                continue;
-            }
-            hook_log(&format!("apply_limit {} {} (was {})", p, val, cur));
-            write_string(p, val);
+        let p = CHARGE_INPUT_SUSPEND_PATHS[0];
+        let cur = read_str_node(p);
+        if cur == val {
+            return;
         }
+        write_string(p, val);
     }
+
+
+
 
     pub fn monitor_tick(&self) {
         if !self.charge_limit_switch_enabled() {
-            if *self.charge_limit_active.lock().unwrap() {
-                *self.charge_limit_active.lock().unwrap() = false;
-                self.apply_charge_control_limit(false);
-            }
             return;
         }
         let capacity = read_int_node("/sys/class/power_supply/battery/capacity");
-        let next = self.should_suspend(capacity);
+        let should_suspend = self.should_suspend(capacity);
         let cur = *self.charge_limit_active.lock().unwrap();
-        if next != cur {
-            *self.charge_limit_active.lock().unwrap() = next;
-            self.apply_charge_control_limit(next);
-            if !next {
+        if should_suspend != cur {
+            *self.charge_limit_active.lock().unwrap() = should_suspend;
+            self.apply_charge_control_limit(should_suspend);
+            if !should_suspend {
                 *self.last_resume.lock().unwrap() = Instant::now();
-            }
-        } else if next {
-
-            let cur_is = read_int_node(&CHARGE_INPUT_SUSPEND_PATHS[0]);
-            if cur_is != 1 {
-                self.apply_charge_control_limit(true);
             }
         }
     }
+
+
+
+
+
+
+
+
 
     fn get_ui_soc_decimal(&self) -> String {
         if !self.power_available() {
@@ -561,6 +580,7 @@ impl Charger {
             _ => 3_374_000,
         };
 
+
         let expected_step = if cf > 100 { cf / 100 } else { 34_650 };
 
         if have_cc {
@@ -574,6 +594,7 @@ impl Charger {
                 let total_span = cc - d.cc_percent_start;
                 let measured_step = if steps > 0 { total_span / steps } else { total_span };
 
+
                 let min_valid = expected_step / 4;
                 let max_valid = expected_step * 4;
                 if measured_step > min_valid && measured_step < max_valid && measured_step > 0 {
@@ -585,6 +606,7 @@ impl Charger {
                     let sum: i64 = d.span_history[..count].iter().sum();
                     d.cc_span = sum / count as i64;
                 }
+
 
                 d.cc_percent_start = cc;
                 d.capacity = capacity;
@@ -610,6 +632,7 @@ impl Charger {
         if off > span {
             off = span;
         }
+
 
         let mut shown = if have_cc {
             ((off * 99 + span / 2) / span) as i32
@@ -656,6 +679,8 @@ impl Default for Charger {
         Self::new()
     }
 }
+
+
 
 impl Interface for Charger {}
 
@@ -745,6 +770,7 @@ impl ICharger for Charger {
         })
     }
 
+
     fn getBattParamNoplug(&self) -> BinderResult<String> {
         Ok(String::new())
     }
@@ -815,6 +841,7 @@ impl ICharger for Charger {
     fn getUsbCurrentEyeDiagram(&self, _model: i32) -> BinderResult<String> {
         Ok(String::new())
     }
+
 
     fn chgExchangeMesgInit(&self) -> BinderResult<i32> {
         Ok(0)
@@ -1028,6 +1055,7 @@ impl ICharger for Charger {
         Ok(0)
     }
 
+
     fn VolDividerIcWorkModeSet(&self, _data: &str) -> BinderResult<i32> {
         Ok(0)
     }
@@ -1130,6 +1158,7 @@ impl ICharger for Charger {
     fn setChgRusConfig(&self, _data: &str) -> BinderResult<i32> {
         Ok(0)
     }
+
 
     fn nightstandby(&self, _status: i32) -> BinderResult<i32> {
         Ok(0)

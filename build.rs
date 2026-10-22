@@ -1,3 +1,5 @@
+
+
 use std::path::PathBuf;
 
 fn main() {
@@ -9,6 +11,8 @@ fn main() {
         .source(PathBuf::from("aidl/vendor/oplus/hardware/charger/testKitFeatureTestResult.aidl"))
         .include_dir(PathBuf::from("aidl"))
         .version(10)
+
+
         .set_async_support(false)
         .output(PathBuf::from("charger.rs"))
         .generate()
