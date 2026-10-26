@@ -1,4 +1,4 @@
-# vendor_oplus-hardware-charger-aidl-rs
+# vendor_oplus-hardware-charger
 
 Rust AIDL HAL for OPlus charging on Xiaomi devices (ICharger V10).
 
@@ -306,24 +306,18 @@ If either property is missing or different, the service:
 ### Provision the watermark before shipping
 
 The HAL does not set these properties itself. They must already exist when the
-service starts. Provision them in the ROM:
+service starts. add them in the ROM:
 
 ```
+/vendor/build.prop
 ro.hoshikv.support=1
 ro.kvports.wattage=1
 ```
 
-or in an init `.rc` that runs before the HAL service:
+you can change these props with your own props or just nuke this feature by yourself 
 
-```
-on early-init
-    setprop ro.hoshikv.support 1
-    setprop ro.kvports.wattage 1
-```
 
-If the properties are absent on your own device, the gate fires and the device
-boots to fastboot. Only ship this service to a device that can be recovered via
-fastboot, and verify both properties before relying on the gate.
+If the properties not found on your roms, this feature trigger the device to fastboot/bootloader. but fine if this exist(this feature doesn't brick your device)
 
 ### sepolicy for the self-destruct path
 
