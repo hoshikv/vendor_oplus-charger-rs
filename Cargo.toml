@@ -3,6 +3,7 @@ name = "vendor-oplus-charger-hal"
 version = "10.0.0"
 edition = "2021"
 description = "Custom OPlus charger AIDL HAL for Xiaomi (Rust port, rsbinder)"
+license = "Apache-2.0"
 
 [[bin]]
 name = "charger-hal-service"

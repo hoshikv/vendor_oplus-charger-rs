@@ -331,7 +331,7 @@ The service domain needs:
 ## License
 
 This project is licensed under the
-[GNU General Public License v2.0](LICENSE).
+[Apache License 2.0](LICENSE).
 
 The AIDL interface snapshots are licensed under Apache-2.0 as stated in their
 file headers.
