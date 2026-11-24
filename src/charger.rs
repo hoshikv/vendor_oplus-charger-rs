@@ -200,7 +200,7 @@ pub struct Charger {
     chg_up_limit_state: Arc<Mutex<String>>,
     chg_up_limit_value: Arc<Mutex<String>>,
     charge_limit_active: Arc<Mutex<bool>>,
-    last_resume: Arc<Mutex<Instant>>,
+    last_resume: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Charger {
@@ -223,7 +223,7 @@ impl Charger {
             chg_up_limit_state: Arc::new(Mutex::new("0".into())),
             chg_up_limit_value: Arc::new(Mutex::new("90".into())),
             charge_limit_active: Arc::new(Mutex::new(false)),
-            last_resume: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(RESUME_COOLDOWN_SECS))),
+            last_resume: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -412,36 +412,48 @@ impl Charger {
     }
 
     fn charge_limit_switch_enabled(&self) -> bool {
-        self.chg_up_limit_state.lock().unwrap().trim() == "1"
+        self.chg_up_limit_state
+            .lock()
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(0)
+            != 0
     }
 
     fn charge_limit_target(&self) -> Option<i32> {
-        self.chg_up_limit_value.lock().unwrap().trim().parse::<i32>().ok()
+        self.chg_up_limit_value
+            .lock()
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|v| (10..=100).contains(v))
     }
 
     fn set_charge_limit_value(&self, value: &str) {
         hook_log(&format!("set_value payload={}", value));
 
-
-
         let (_, limit, _force, _recharge) = parse_charge_limit_control_payload(value);
         let parsed = limit.or_else(|| parse_first_int(value));
-        let normalized = parsed.map(|v| v.to_string()).unwrap_or_else(|| value.to_string());
-        *self.chg_up_limit_value.lock().unwrap() = normalized;
+        if let Some(v) = parsed.filter(|v| (10..=100).contains(v)) {
+            *self.chg_up_limit_value.lock().unwrap() = v.to_string();
+        }
         if !self.charge_limit_switch_enabled() {
             return;
         }
-        *self.last_resume.lock().unwrap() = Instant::now() - Duration::from_secs(RESUME_COOLDOWN_SECS + 1);
+        *self.last_resume.lock().unwrap() = None;
         let capacity = read_int_node("/sys/class/power_supply/battery/capacity");
-        let suspend = self.should_suspend(capacity);
+        if capacity < 0 {
+            return;
+        }
+        let suspend = self.charge_limit_target().is_some_and(|lim| capacity >= lim);
         let was_active = *self.charge_limit_active.lock().unwrap();
         hook_log(&format!("set_value cap={} suspend={} was_active={}", capacity, suspend, was_active));
         *self.charge_limit_active.lock().unwrap() = suspend;
         self.apply_charge_control_limit(suspend);
         if !suspend && was_active {
-
-
-            *self.last_resume.lock().unwrap() = Instant::now();
+            *self.last_resume.lock().unwrap() = Some(Instant::now());
         }
     }
 
@@ -449,46 +461,46 @@ impl Charger {
         hook_log(&format!("set_state payload={}", value));
         let (enabled, limit) = parse_charge_limit_state_payload(value);
         *self.chg_up_limit_state.lock().unwrap() = enabled.to_string();
-        if let Some(limit) = limit {
+        if let Some(limit) = limit.filter(|v| (10..=100).contains(v)) {
             *self.chg_up_limit_value.lock().unwrap() = limit.to_string();
         }
         if enabled == 0 {
             hook_log(&format!("set_state enabled=0 -> DISABLE"));
             *self.charge_limit_active.lock().unwrap() = false;
-            *self.chg_up_limit_value.lock().unwrap() = String::new();
+            *self.last_resume.lock().unwrap() = None;
             self.apply_charge_control_limit(false);
         } else {
-
-            *self.last_resume.lock().unwrap() = Instant::now() - Duration::from_secs(RESUME_COOLDOWN_SECS + 1);
+            *self.last_resume.lock().unwrap() = None;
             let capacity = read_int_node("/sys/class/power_supply/battery/capacity");
-            let suspend = self.should_suspend(capacity);
+            if capacity < 0 {
+                return;
+            }
+            let suspend = self.charge_limit_target().is_some_and(|lim| capacity >= lim);
             let was_active = *self.charge_limit_active.lock().unwrap();
             hook_log(&format!("set_state enabled={} cap={} suspend={} was_active={}", enabled, capacity, suspend, was_active));
             *self.charge_limit_active.lock().unwrap() = suspend;
             self.apply_charge_control_limit(suspend);
             if !suspend && was_active {
-                *self.last_resume.lock().unwrap() = Instant::now();
+                *self.last_resume.lock().unwrap() = Some(Instant::now());
             }
         }
     }
 
-
-
-
-
     fn should_suspend(&self, capacity: i32) -> bool {
+        if capacity < 0 {
+            return *self.charge_limit_active.lock().unwrap();
+        }
         let Some(limit) = self.charge_limit_target() else {
             return false;
         };
         let active = *self.charge_limit_active.lock().unwrap();
         if active {
-
             capacity >= limit - CHARGE_LIMIT_RESUME_DELTA
         } else {
-
-            let elapsed = self.last_resume.lock().unwrap().elapsed().as_secs();
-            if elapsed < RESUME_COOLDOWN_SECS {
-                return false;
+            if let Some(resumed_at) = *self.last_resume.lock().unwrap() {
+                if resumed_at.elapsed().as_secs() < RESUME_COOLDOWN_SECS {
+                    return false;
+                }
             }
             capacity >= limit
         }
@@ -504,23 +516,24 @@ impl Charger {
         write_string(p, val);
     }
 
-
-
-
     pub fn monitor_tick(&self) {
         if !self.charge_limit_switch_enabled() {
             return;
         }
         let capacity = read_int_node("/sys/class/power_supply/battery/capacity");
+        if capacity < 0 {
+            return;
+        }
         let should_suspend = self.should_suspend(capacity);
         let cur = *self.charge_limit_active.lock().unwrap();
         if should_suspend != cur {
             *self.charge_limit_active.lock().unwrap() = should_suspend;
-            self.apply_charge_control_limit(should_suspend);
             if !should_suspend {
-                *self.last_resume.lock().unwrap() = Instant::now();
+                *self.last_resume.lock().unwrap() = Some(Instant::now());
             }
         }
+        // Always reconcile sysfs state so kernel/ADSP resets on USB replug cannot bypass the limit.
+        self.apply_charge_control_limit(should_suspend);
     }
 
 
