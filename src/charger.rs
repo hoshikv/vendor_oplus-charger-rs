@@ -21,8 +21,15 @@ use crate::aidl_bindings::vendor::oplus::hardware::charger::testKitFeatureTestRe
 
 const DECIMAL_FAST_WINDOW: f64 = 60.0;
 const DECIMAL_FAST_INTERVAL: f64 = 0.20;
-const DECIMAL_SLOW_INTERVAL: f64 = 1.0;
-const SPAN_HISTORY_SIZE: usize = 5;
+const DECIMAL_CHARGING_INTERVAL: f64 = 0.50;
+const DECIMAL_IDLE_INTERVAL: f64 = 1.0;
+const DECIMAL_WRAP_HOLD_SECS: f64 = 5.0;
+
+const SOC_DECIMAL_PATHS: &[&str] = &[
+    "/sys/class/qcom-battery/soc_decimal",
+    "/sys/class/power_supply/bms/soc_decimal",
+    "/sys/class/power_supply/battery/soc_decimal",
+];
 
 
 
@@ -175,17 +182,17 @@ fn parse_first_int(value: &str) -> Option<i32> {
 
 use std::sync::Arc;
 struct DecimalState {
-    init: bool,
-    capacity: i32,
-    cc_percent_start: i64,
-    cc_span: i64,
-    span_history: [i64; SPAN_HISTORY_SIZE],
-    span_count: usize,
+    last_cap: i32,
+    last_dec: i32,
+    last_raw_dec: i32,
+    has_last: bool,
     was_charging: bool,
+    hw_max_dec: i32,
     cache: String,
     last: Instant,
     charge_start: Instant,
     charge_start_valid: bool,
+    wrap_hold_since: Option<Instant>,
 }
 
 pub struct Charger {
@@ -201,17 +208,17 @@ impl Charger {
         let now = Instant::now();
         Charger {
             decimal: Arc::new(Mutex::new(DecimalState {
-                init: false,
-                capacity: -1,
-                cc_percent_start: 0,
-                cc_span: 0,
-                span_history: [0; SPAN_HISTORY_SIZE],
-                span_count: 0,
+                last_cap: -1,
+                last_dec: 0,
+                last_raw_dec: 0,
+                has_last: false,
                 was_charging: false,
+                hw_max_dec: 0,
                 cache: String::new(),
                 last: now,
                 charge_start: now,
                 charge_start_valid: false,
+                wrap_hold_since: None,
             })),
             chg_up_limit_state: Arc::new(Mutex::new("0".into())),
             chg_up_limit_value: Arc::new(Mutex::new("90".into())),
@@ -524,39 +531,51 @@ impl Charger {
 
 
 
-    fn get_ui_soc_decimal(&self) -> String {
-        if !self.power_available() {
-            let mut cap = read_int_node("/sys/class/power_supply/battery/capacity");
-            if cap < 0 {
-                cap = 0;
+    fn read_hw_soc_decimal() -> Option<i32> {
+        for p in SOC_DECIMAL_PATHS {
+            if let Some(v) = read_long(p) {
+                if (0..=100).contains(&v) {
+                    return Some(v.clamp(0, 99) as i32);
+                }
             }
-            if cap > 100 {
-                cap = 100;
-            }
-            return format!("{},{}", cap * 100, cap * 100 + 1);
         }
+        None
+    }
+
+    fn read_capacity_clamped() -> i32 {
+        read_int_node("/sys/class/power_supply/battery/capacity").clamp(0, 100)
+    }
+
+    fn get_ui_soc_decimal(&self) -> String {
         let mut d = self.decimal.lock().unwrap();
         let now = Instant::now();
         let status = read_str_node("/sys/class/power_supply/battery/status");
         let charging = status == "Charging";
 
-        if charging && !d.was_charging {
+        if charging != d.was_charging {
             d.cache.clear();
-            d.charge_start = now;
-            d.charge_start_valid = true;
+            d.wrap_hold_since = None;
+            if charging {
+                d.charge_start = now;
+                d.charge_start_valid = true;
+            }
         }
         d.was_charging = charging;
 
         if !d.cache.is_empty() {
-            let since_start = if d.charge_start_valid {
-                now.duration_since(d.charge_start).as_secs_f64()
+            let interval = if charging {
+                let since_start = if d.charge_start_valid {
+                    now.duration_since(d.charge_start).as_secs_f64()
+                } else {
+                    1e9
+                };
+                if since_start < DECIMAL_FAST_WINDOW {
+                    DECIMAL_FAST_INTERVAL
+                } else {
+                    DECIMAL_CHARGING_INTERVAL
+                }
             } else {
-                1e9
-            };
-            let interval = if charging && since_start < DECIMAL_FAST_WINDOW {
-                DECIMAL_FAST_INTERVAL
-            } else {
-                DECIMAL_SLOW_INTERVAL
+                DECIMAL_IDLE_INTERVAL
             };
             if now.duration_since(d.last).as_secs_f64() < interval {
                 return d.cache.clone();
@@ -564,99 +583,111 @@ impl Charger {
         }
         d.last = now;
 
-        let mut capacity = read_int_node("/sys/class/power_supply/battery/capacity");
-        if capacity < 0 {
-            capacity = 0;
-        }
-        if capacity > 100 {
-            capacity = 100;
-        }
-
-        let cc_opt = read_long("/sys/class/power_supply/battery/charge_counter");
-        let have_cc = matches!(cc_opt, Some(v) if v > 0);
-        let cc = cc_opt.unwrap_or(0);
-        let cf = match read_long("/sys/class/power_supply/battery/charge_full") {
-            Some(v) if v > 0 => v,
-            _ => 3_374_000,
-        };
-
-
-        let expected_step = if cf > 100 { cf / 100 } else { 34_650 };
-
-        if have_cc {
-            if !d.init {
-                d.cc_percent_start = cc;
-                d.capacity = capacity;
-                d.init = true;
-            } else if capacity > d.capacity {
-
-                let steps = (capacity - d.capacity).max(1) as i64;
-                let total_span = cc - d.cc_percent_start;
-                let measured_step = if steps > 0 { total_span / steps } else { total_span };
-
-
-                let min_valid = expected_step / 4;
-                let max_valid = expected_step * 4;
-                if measured_step > min_valid && measured_step < max_valid && measured_step > 0 {
-
-                    let idx = d.span_count % SPAN_HISTORY_SIZE;
-                    d.span_history[idx] = measured_step;
-                    d.span_count += 1;
-                    let count = d.span_count.min(SPAN_HISTORY_SIZE);
-                    let sum: i64 = d.span_history[..count].iter().sum();
-                    d.cc_span = sum / count as i64;
-                }
-
-
-                d.cc_percent_start = cc;
-                d.capacity = capacity;
-            } else if capacity < d.capacity {
-
-                let span = if d.cc_span > 0 { d.cc_span } else { expected_step };
-                d.cc_percent_start = cc - span;
-                d.capacity = capacity;
-            } else if capacity == d.capacity && d.cc_span == 0 && d.init {
-
-                d.cc_span = expected_step;
+        // Read capacity & hardware ADSP soc_decimal consistently across boundary transitions.
+        let mut capacity = Self::read_capacity_clamped();
+        let mut hw_dec = Self::read_hw_soc_decimal();
+        if hw_dec.is_some() {
+            let cap_after = Self::read_capacity_clamped();
+            if cap_after != capacity {
+                capacity = cap_after;
+                hw_dec = Self::read_hw_soc_decimal();
             }
         }
 
-        let mut span = if d.cc_span > 0 { d.cc_span } else { expected_step };
-        if span <= 0 {
-            span = 1;
-        }
-        let mut off = cc - d.cc_percent_start;
-        if off < 0 {
-            off = 0;
-        }
-        if off > span {
-            off = span;
+        if capacity >= 100 {
+            d.last_cap = 100;
+            d.last_dec = 0;
+            d.last_raw_dec = 0;
+            d.has_last = true;
+            d.wrap_hold_since = None;
+            d.cache = "10000,10000".to_string();
+            return d.cache.clone();
         }
 
+        // Xiaomi ADSP computes soc_decimal in charge_full_design scale (e.g. 5000mAh),
+        // so on aged batteries (charge_full < charge_full_design) soc_decimal peaks at
+        // ~(charge_full / charge_full_design) * 100 (e.g. ~61-65) when capacity ticks +1.
+        // Scale raw soc_decimal by charge_full_design / charge_full and gently calibrate
+        // against observed wrap peaks so the UI smoothly reaches ~99 right before capacity +1.
+        let mut shown = if let Some(raw_dec) = hw_dec {
+            let cf = read_long("/sys/class/power_supply/battery/charge_full").unwrap_or(0);
+            let cfd = read_long("/sys/class/power_supply/battery/charge_full_design").unwrap_or(0);
+            let base_max = if cf > 0 && cfd > 0 && cf < cfd {
+                ((cf * 100 + cfd / 2) / cfd).clamp(35, 100) as i32
+            } else {
+                100
+            };
 
-        let mut shown = if have_cc {
-            ((off * 99 + span / 2) / span) as i32
+            if d.hw_max_dec <= 0 {
+                d.hw_max_dec = base_max;
+            }
+
+            // If capacity just ticked +1 while charging and raw_dec wrapped, refine hw_max_dec.
+            if charging
+                && d.has_last
+                && capacity == d.last_cap + 1
+                && raw_dec <= 15
+                && d.last_raw_dec >= 30
+            {
+                let observed = (d.last_raw_dec + 2).clamp(35, 100);
+                let lo = (base_max - 12).max(35);
+                let hi = (base_max + 8).min(100);
+                if observed >= lo && observed <= hi {
+                    d.hw_max_dec = ((d.hw_max_dec * 2 + observed) / 3).clamp(lo, hi);
+                }
+            }
+
+            d.last_raw_dec = raw_dec;
+            let denom = d.hw_max_dec.max(1);
+            if denom < 100 {
+                ((raw_dec * 99 + denom / 2) / denom).clamp(0, 99)
+            } else {
+                raw_dec.clamp(0, 99)
+            }
         } else {
-            0
+            // Fallback for devices without hardware soc_decimal:
+            // derive sub-percent directly from absolute charge_counter / charge_full
+            // so unplug/replug never resets the decimal back to 00.
+            let cc = read_long("/sys/class/power_supply/battery/charge_counter").unwrap_or(0);
+            let cf = read_long("/sys/class/power_supply/battery/charge_full").unwrap_or(0);
+            if cc > 0 && cf > 0 {
+                (((cc as i128 * 10_000) / cf as i128) % 100).clamp(0, 99) as i32
+            } else {
+                0
+            }
         };
-        if shown < 0 {
-            shown = 0;
+
+        // Guard against 1-frame capacity/decimal wrap race while charging:
+        // e.g. soc_decimal wrapped 99 -> 00 slightly before capacity bumped, or vice versa.
+        if charging && d.has_last {
+            if capacity == d.last_cap && d.last_dec >= 90 && shown <= 10 {
+                let hold_start = *d.wrap_hold_since.get_or_insert(now);
+                if now.duration_since(hold_start).as_secs_f64() < DECIMAL_WRAP_HOLD_SECS {
+                    shown = 99;
+                } else {
+                    d.wrap_hold_since = None;
+                }
+            } else if capacity == d.last_cap + 1 && d.last_dec >= 90 && shown >= 90 {
+                shown = 0;
+                d.wrap_hold_since = None;
+            } else {
+                d.wrap_hold_since = None;
+            }
+        } else {
+            d.wrap_hold_since = None;
         }
-        if shown > 99 {
-            shown = 99;
-        }
-        let mut end_dec = shown + 1;
-        if end_dec > 99 {
-            end_dec = 99;
-        }
-        let mut start_val = capacity * 100 + shown;
-        let mut end_val = capacity * 100 + end_dec;
-        if start_val < 1 {
-            start_val = 1;
-        }
-        if end_val < start_val {
-            end_val = start_val;
-        }
+
+        shown = shown.clamp(0, 99);
+        d.last_cap = capacity;
+        d.last_dec = shown;
+        d.has_last = true;
+
+        let start_val = (capacity * 100 + shown).max(1);
+        let end_val = if charging && shown < 99 {
+            start_val + 1
+        } else {
+            start_val
+        };
         d.cache = format!("{},{}", start_val, end_val);
         d.cache.clone()
     }
