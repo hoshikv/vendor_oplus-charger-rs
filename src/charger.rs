@@ -123,6 +123,17 @@ fn read_int_any(paths: &[&str]) -> i32 {
     0
 }
 
+fn read_positive_int_any(paths: &[&str]) -> i32 {
+    for p in paths {
+        if let Some(v) = read_long(p) {
+            if v > 0 {
+                return v as i32;
+            }
+        }
+    }
+    0
+}
+
 fn write_string(path: &str, value: &str) {
     let _ = fs::write(path, value);
 }
@@ -227,10 +238,15 @@ impl Charger {
         }
     }
 
+    fn get_apdo_power_w(&self) -> i32 {
+        read_positive_int_any(&[
+            "/sys/class/qcom-battery/apdo_max",
+            "/sys/class/power_supply/usb/apdo_max",
+        ])
+    }
+
     fn get_adapter_power_w(&self) -> i32 {
-
-
-        read_int_any(&[
+        read_positive_int_any(&[
             "/sys/class/qcom-battery/apdo_max",
             "/sys/class/qcom-battery/power_max",
             "/sys/class/power_supply/usb/apdo_max",
@@ -278,13 +294,23 @@ impl Charger {
 
 
 
+    fn is_data_port_only(&self, usb_real: &str, pw: i32) -> bool {
+        pw <= 0 && Self::is_data_port_usb_type(usb_real)
+    }
+
     fn classify_fast_charge(&self) -> i32 {
         let online = self.get_usb_online() != 0;
-        let usb_real = self.get_usb_real_type();
         if !online {
             return 0;
         }
-        if Self::is_data_port_usb_type(&usb_real) {
+        // Fast path: check APDO / adapter power first so SuperVOOC/90W detection is
+        // instant without waiting ~1s for quick_charge_type or usb_real_type handshake.
+        let pw = self.get_adapter_power_w();
+        if pw > 20 {
+            return 3;
+        }
+        let usb_real = self.get_usb_real_type();
+        if self.is_data_port_only(&usb_real, pw) {
             return 0;
         }
         let qct = self.get_quick_charge_type();
@@ -324,10 +350,7 @@ impl Charger {
         if ul.contains("sdp") || ul.contains("cdp") {
             return 0;
         }
-        let pw = self.get_adapter_power_w();
-        if pw > 20 {
-            3
-        } else if pw > 10 {
+        if pw > 10 {
             2
         } else if pw > 3 || online {
             1
@@ -341,7 +364,9 @@ impl Charger {
     }
 
     fn fast_type_tech(&self) -> i32 {
-
+        if self.get_usb_online() != 0 && self.get_adapter_power_w() > 20 {
+            return 3;
+        }
         let qct = self.get_quick_charge_type();
         let qct_num: i32 = qct.trim().parse().unwrap_or(-1);
         match qct_num {
@@ -364,35 +389,58 @@ impl Charger {
 
     fn is_fast_charging(&self) -> bool {
         let online = self.get_usb_online() != 0;
-        online
-            && !Self::is_data_port_usb_type(&self.get_usb_real_type())
+        if !online {
+            return false;
+        }
+        let pw = self.get_adapter_power_w();
+        if pw >= 10 {
+            return true;
+        }
+        !self.is_data_port_only(&self.get_usb_real_type(), pw)
             && (self.fast_type() > 0
                 || self.get_fastchg_mode() != 0
-                || self.get_sport_mode() != 0
-                || self.get_adapter_power_w() >= 10)
+                || self.get_sport_mode() != 0)
     }
 
     fn is_svooc_active(&self) -> bool {
         let online = self.get_usb_online() != 0;
-        online
-            && !Self::is_data_port_usb_type(&self.get_usb_real_type())
+        if !online {
+            return false;
+        }
+        let pw = self.get_adapter_power_w();
+        if pw >= 20 {
+            return true;
+        }
+        !self.is_data_port_only(&self.get_usb_real_type(), pw)
             && (self.fast_type() >= 2
                 || self.get_fastchg_mode() != 0
-                || self.get_sport_mode() != 0
-                || self.get_adapter_power_w() >= 20)
+                || self.get_sport_mode() != 0)
     }
 
     fn is_pps_active(&self) -> bool {
         let online = self.get_usb_online() != 0;
-        let usb = self.get_usb_real_type().to_lowercase();
+        if !online {
+            return false;
+        }
+        let apdo = self.get_apdo_power_w();
+        if apdo > 0 {
+            return true;
+        }
+        let pw = self.get_adapter_power_w();
+        if pw >= 20 {
+            return true;
+        }
+        let usb_real = self.get_usb_real_type();
+        if self.is_data_port_only(&usb_real, pw) {
+            return false;
+        }
+        let usb = usb_real.to_lowercase();
         let quick = self.get_quick_charge_type().to_lowercase();
-        online
-            && !Self::is_data_port_usb_type(&self.get_usb_real_type())
-            && (self.fast_type_tech() >= 3
-                || usb.contains("pd")
-                || usb.contains("pps")
-                || quick.contains("pd")
-                || quick.contains("pps"))
+        self.fast_type_tech() >= 3
+            || usb.contains("pd")
+            || usb.contains("pps")
+            || quick.contains("pd")
+            || quick.contains("pps")
     }
 
     fn should_show_power(&self) -> bool {
@@ -400,9 +448,11 @@ impl Charger {
     }
 
     fn power_available(&self) -> bool {
-        self.get_usb_online() != 0
-            && !Self::is_data_port_usb_type(&self.get_usb_real_type())
-            && self.get_adapter_power_w() > 0
+        if self.get_usb_online() == 0 {
+            return false;
+        }
+        let pw = self.get_adapter_power_w();
+        pw > 0
     }
 
 
